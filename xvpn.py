@@ -9,6 +9,10 @@ xvpn — Xray-клиент для Termux с раздачей на точку д�
 Быстрые режимы:
   xvpn only google.com youtube.com   # ТОЛЬКО эти домены через VPN, всё остальное напрямую
   xvpn except yandex.ru sber.ru      # ВСЁ через VPN, кроме этих доменов напрямую
+  xvpn only | xvpn except            # без доменов: вернуться к сохранённому списку
+  xvpn full                          # полный режим: ВСЁ через VPN (списки не стираются)
+  xvpn toggle                        # переключатель: полный режим <-> «только эти домены через VPN»
+  (если Xray запущен, режим применяется сразу, перезапуск вручную не нужен)
 
 Точная настройка:
   xvpn direct add yandex.ru geosite:category-ru geoip:ru   # напрямую
@@ -56,6 +60,7 @@ DEFAULTS = {
     "proxy_dns": "1.1.1.1",
     "iface": "",
     "dns_hijack": False,     # перехватывать DNS клиентов точки доступа (по умолчанию НЕТ: у клиентов свой DNS)
+    "full": False,           # полный режим: всё через VPN, список direct игнорируется (но не удаляется)
     "dns_servers": [],       # принудительные DNS для всех клиентов: [основной, вторичный]; пусто = выкл
     "exclude": [],           # устройства (IP/сеть/MAC), которые вообще не трогаем (PS3 и т.п.)
     "redir_ports": "auto",   # какие TCP-порты заворачивать в Xray: auto | all | 80,443,...
@@ -301,7 +306,7 @@ def build_config(s, root_mode):
     proxy_out = parse_vless(s["link"])
     proxy_out.pop("_name", None)
 
-    d_dom, d_ip = split_rules(read_list("direct"))
+    d_dom, d_ip = ([], []) if s.get("full") else split_rules(read_list("direct"))
     p_dom, p_ip = split_rules(read_list("proxy"))
     b_dom, b_ip = split_rules(read_list("block"))
     proxy_default = s["default"] == "proxy"
@@ -563,7 +568,7 @@ def cmd_default(a):
     if a not in (["proxy"], ["direct"]):
         die("Использование: xvpn default proxy|direct")
     s = load_settings()
-    s["default"] = a[0]
+    s["default"], s["full"] = a[0], False
     save_settings(s)
     txt = "через VPN (кроме списка direct)" if a[0] == "proxy" else "напрямую (кроме списка proxy)"
     print(f"✓ Всё остальное идёт {txt}")
@@ -908,34 +913,78 @@ def cmd_doctor(_a):
 
 def print_mode(s):
     p, d = read_list("proxy"), read_list("direct")
-    if s["default"] == "direct":
+    if s["default"] == "proxy" and s.get("full"):
+        print("  Режим: ПОЛНЫЙ — весь трафик через VPN "
+              f"(сохранены списки: proxy={len(p)}, direct={len(d)}; вернуть: xvpn only / xvpn except)")
+    elif s["default"] == "direct":
         print(f"  Режим: всё НАПРЯМУЮ, через VPN только: {', '.join(p) if p else '(список proxy пуст)'}")
     else:
         print(f"  Режим: всё ЧЕРЕЗ VPN, напрямую только: {', '.join(d) if d else '(список direct пуст)'}")
 
 
+def apply_now():
+    """Если Xray запущен — сразу перезапускаем, чтобы режим вступил в силу."""
+    if read_pid():
+        print("↻ Применяю...")
+        cmd_restart([])
+    else:
+        print("  Xray не запущен — режим применится при xvpn start")
+
+
 def cmd_only(a):
-    """Только указанные домены через VPN, остальное напрямую."""
-    if not a:
-        die("Использование: xvpn only google.com youtube.com   (geosite:google, geoip:... тоже можно)")
+    """only <домены> — заменить список proxy и включить режим; `only` без аргументов — вернуться
+    к сохранённому списку."""
     s = load_settings()
-    s["default"] = "direct"
+    if a:
+        old = read_list("proxy")
+        write_list("proxy", list(dict.fromkeys(a)))
+        if old and set(old) != set(a):
+            print(f"  Список proxy заменён (было: {', '.join(old)}). Добавлять без замены: xvpn proxy add <домен>")
+    elif not read_list("proxy"):
+        die("Список proxy пуст. Укажи домены: xvpn only google.com youtube.com")
+    s["default"], s["full"] = "direct", False
     save_settings(s)
-    write_list("proxy", list(dict.fromkeys(a)))
-    print("✓ Режим «только эти домены через VPN». Применить: xvpn restart")
+    print("✓ Режим «всё напрямую, через VPN только домены из списка proxy»")
     print_mode(s)
+    apply_now()
 
 
 def cmd_except(a):
-    """Всё через VPN, кроме указанных доменов (они напрямую)."""
-    if not a:
-        die("Использование: xvpn except yandex.ru sber.ru geoip:ru")
+    """except <домены> — заменить список direct и включить режим; `except` без аргументов —
+    вернуться к сохранённому списку."""
     s = load_settings()
-    s["default"] = "proxy"
+    if a:
+        old = read_list("direct")
+        write_list("direct", list(dict.fromkeys(a)))
+        if old and set(old) != set(a):
+            print(f"  Список direct заменён (было: {', '.join(old)}). Добавлять без замены: xvpn direct add <домен>")
+    elif not read_list("direct"):
+        die("Список direct пуст. Укажи домены: xvpn except yandex.ru sber.ru")
+    s["default"], s["full"] = "proxy", False
     save_settings(s)
-    write_list("direct", list(dict.fromkeys(a)))
-    print("✓ Режим «всё через VPN, кроме этих». Применить: xvpn restart")
+    print("✓ Режим «всё через VPN, кроме доменов из списка direct»")
     print_mode(s)
+    apply_now()
+
+
+def cmd_full(_a):
+    """Полный режим: весь трафик через VPN. Списки direct/proxy не трогаем — они вернутся по only/except."""
+    s = load_settings()
+    s["default"], s["full"] = "proxy", True
+    save_settings(s)
+    print("✓ Полный режим: весь трафик через VPN. Списки сохранены (вернуть: xvpn only / xvpn except)")
+    apply_now()
+
+
+def cmd_toggle(_a):
+    """Быстрое переключение: полный режим <-> «всё напрямую, кроме доменов из списка proxy»."""
+    s = load_settings()
+    if s["default"] == "proxy" and s["full"]:
+        if not read_list("proxy"):
+            die("Список proxy пуст — переключаться не на что. Сначала: xvpn only google.com ...")
+        cmd_only([])
+    else:
+        cmd_full([])
 
 
 def cmd_mode(_a):
@@ -1037,7 +1086,8 @@ def cmd_log(_a):
 
 def usage():
     print(__doc__)
-    print("Команды: install | set <vless://> | only <домены> | except <домены> | mode | default proxy|direct |"
+    print("Команды: install | set <vless://> | only [домены] | except [домены] | full | toggle | mode |"
+          " default proxy|direct |"
           " direct|proxy|block add|del|list|edit | clients | exclude add|del|list <MAC|IP> | dns set <осн> [вторичный]|on|off|show |"
           " ports auto|all|80,443 | start [--self] [--iface X] [--noroot] |"
           " stop | restart | status | check | doctor | log | geo")
@@ -1050,6 +1100,7 @@ def main():
     c, a = argv[0], argv[1:]
     table = {"install": cmd_install, "geo": cmd_geo, "set": cmd_set, "default": cmd_default,
              "only": cmd_only, "except": cmd_except, "mode": cmd_mode,
+             "full": cmd_full, "toggle": cmd_toggle,
              "exclude": cmd_exclude, "clients": cmd_clients, "dns": cmd_dns, "ports": cmd_ports,
              "doctor": cmd_doctor, "_dnsfwd": cmd_dnsfwd,
              "start": cmd_start, "stop": cmd_stop, "restart": cmd_restart,
